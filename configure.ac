@@ -150,8 +150,10 @@ AC_MSG_RESULT($bsymbolic)
 
 if echo "$host" | $GREP "mingw" >/dev/null 2>&1; then
     LTUNDEF="-no-undefined"
+    src_index_ffmsindex_LDFLAGS="$src_index_ffmsindex_LDFLAGS -municode"
 fi
 AC_SUBST([LTUNDEF])
+AC_SUBST([src_index_ffmsindex_LDFLAGS])
 
 AC_CONFIG_FILES([
 Makefile
