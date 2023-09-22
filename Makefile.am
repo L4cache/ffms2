@@ -42,7 +42,10 @@ src_core_libffms2_la_SOURCES = \
 	src/vapoursynth/VapourSynth.h \
 	src/vapoursynth/vapoursource.cpp \
 	src/vapoursynth/vapoursource.h \
-	src/vapoursynth/vapoursynth.cpp
+	src/vapoursynth/vapoursynth.cpp \
+	src/vapoursynth/vapoursource4.cpp \
+	src/vapoursynth/vapoursource4.h \
+	src/vapoursynth/vapoursynth4.cpp
 
 if AVISYNTH
 src_core_libffms2_la_SOURCES += \
