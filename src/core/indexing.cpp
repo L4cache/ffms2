@@ -397,8 +397,7 @@ void FFMS_Indexer::ParseVideoPacket(SharedAVContext &VideoContext, AVPacket *pkt
 
     if (VideoContext.CodecContext->codec_id == AV_CODEC_ID_VP8)
         ParseVP8(pkt->data[0], Invisible, FrameType);
-    else if (VideoContext.CodecContext->codec_id == AV_CODEC_ID_VP9 ||
-             VideoContext.CodecContext->codec_id == AV_CODEC_ID_AV1)
+    else if (VideoContext.CodecContext->codec_id == AV_CODEC_ID_VP9)
         ParseVP9(pkt->data[0], FrameType);
 }
 
