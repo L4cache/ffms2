@@ -114,11 +114,11 @@ static AVPixelFormat CSNameToPIXFMT(const char *CSName, AVPixelFormat Default, b
 }
 
 AvisynthVideoSource::AvisynthVideoSource(const char *SourceFile, int Track, FFMS_Index *Index,
-    int FPSNum, int FPSDen, int Threads, int SeekMode, int RFFMode,
+    int AFPSNum, int AFPSDen, int Threads, int SeekMode, int RFFMode,
     int ResizeToWidth, int ResizeToHeight, const char *ResizerName,
     const char *ConvertToFormatName, const char *VarPrefix, IScriptEnvironment* Env)
-    : FPSNum(FPSNum)
-    , FPSDen(FPSDen)
+    : FPSNum(AFPSNum)
+    , FPSDen(AFPSDen)
     , RFFMode(RFFMode)
     , VarPrefix(VarPrefix) {
     VI = {};
@@ -190,6 +190,11 @@ AvisynthVideoSource::AvisynthVideoSource(const char *SourceFile, int Track, FFMS
         }
 
         if (RFFMode == 2) {
+            if (VP->TopFieldFirst) {
+                for (auto &iter : FieldList)
+                    std::swap(iter.Top, iter.Bottom);
+            }
+
             VI.num_frames = (VI.num_frames * 4) / 5;
             VI.fps_denominator *= 5;
             VI.fps_numerator *= 4;
@@ -227,19 +232,25 @@ AvisynthVideoSource::AvisynthVideoSource(const char *SourceFile, int Track, FFMS
             FieldList.resize(VI.num_frames);
         }
     } else {
+        VI.fps_denominator = VP->FPSDenominator;
+        VI.fps_numerator = VP->FPSNumerator;
+        VI.num_frames = VP->NumFrames;
         if (FPSNum > 0 && FPSDen > 0) {
-            VI.fps_denominator = FPSDen;
-            VI.fps_numerator = FPSNum;
-            if (VP->NumFrames > 1) {
-                VI.num_frames = static_cast<int>((VP->LastTime - VP->FirstTime) * (1 + 1. / (VP->NumFrames - 1)) * FPSNum / FPSDen + 0.5);
-                if (VI.num_frames < 1) VI.num_frames = 1;
+            vsh::reduceRational(&FPSNum, &FPSDen);
+            if (VI.fps_denominator != FPSDen || VI.fps_numerator != FPSNum) {
+                VI.fps_denominator = FPSDen;
+                VI.fps_numerator = FPSNum;
+                if (VP->NumFrames > 1) {
+                    VI.num_frames = static_cast<int>((VP->LastTime - VP->FirstTime) * (1 + 1. / (VP->NumFrames - 1)) * FPSNum / FPSDen + 0.5);
+                    if (VI.num_frames < 1)
+                        VI.num_frames = 1;
+                } else {
+                    VI.num_frames = 1;
+                }
             } else {
-                VI.num_frames = 1;
+                FPSNum = 0;
+                FPSDen = 0;
             }
-        } else {
-            VI.fps_denominator = VP->FPSDenominator;
-            VI.fps_numerator = VP->FPSNumerator;
-            VI.num_frames = VP->NumFrames;
         }
     }
 
@@ -544,7 +555,7 @@ PVideoFrame AvisynthVideoSource::GetFrame(int n, IScriptEnvironment *Env) {
         if (FieldList[n].Top == FieldList[n].Bottom) {
             OutputFrame(Frame, Dst, Env);
         } else {
-            int FirstField = std::min(FieldList[n].Top, FieldList[n].Bottom) == FieldList[n].Bottom;
+            int FirstField = std::min(FieldList[n].Top, FieldList[n].Bottom) == (FFMS_GetVideoProperties(V)->TopFieldFirst ? FieldList[n].Top : FieldList[n].Bottom);
             OutputField(Frame, Dst, FirstField, Env);
             Frame = FFMS_GetFrame(V, std::max(FieldList[n].Top, FieldList[n].Bottom), &E);
             if (Frame == nullptr)
@@ -584,7 +595,7 @@ PVideoFrame AvisynthVideoSource::GetFrame(int n, IScriptEnvironment *Env) {
                     num = 1;
                 int64_t DurNum = TB->Num * num;
                 int64_t DurDen = TB->Den * 1000;
-                vsh::muldivRational(&DurNum, &DurDen, 1, 1);
+                vsh::reduceRational(&DurNum, &DurDen);
                 Env->propSetInt(props, "_DurationNum", DurNum, 0);
                 Env->propSetInt(props, "_DurationDen", DurDen, 0);
                 Env->propSetFloat(props, "_AbsoluteTime", ((static_cast<double>(TB->Num) / 1000) * FFMS_GetFrameInfo(T, n)->PTS) / TB->Den, 0);
