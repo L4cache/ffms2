@@ -25,6 +25,32 @@
 #include <thread>
 
 
+void DecoderDelay::Reset() {
+    ThreadDelayCounter = 0;
+    ReorderDelayCounter = 0;
+}
+
+void DecoderDelay::Increment(bool MarkedHidden, bool SecondField) {
+    if (ThreadDelayCounter < ThreadDelay && (!MarkedHidden || SecondField)) {
+        ThreadDelayCounter++;
+    } else if (!SecondField && !MarkedHidden) {
+        ReorderDelayCounter++;
+    }
+}
+
+void DecoderDelay::Decrement() {
+    if (ReorderDelayCounter) {
+        ReorderDelayCounter--;
+    } else {
+        ThreadDelayCounter--;
+    }
+}
+
+bool DecoderDelay::IsExceeded() {
+    return ThreadDelayCounter >= ThreadDelay && ReorderDelayCounter > ReorderDelay;
+}
+
+
 void FFMS_VideoSource::SanityCheckFrameForData(AVFrame *Frame) {
     for (int i = 0; i < 4; i++) {
         if (Frame->data[i] != nullptr && Frame->linesize[i] != 0)
@@ -241,16 +267,19 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
         // in order to not confuse our own delay guesses later
         // Doesn't affect actual vc1 reordering unlike h264
         if (CodecContext->codec_id == AV_CODEC_ID_VC1 && CodecContext->has_b_frames) {
-            Delay = 7 + (CodecContext->thread_count - 1); // the maximum possible value for vc1
+            Delay.ReorderDelay = 7;     // the maximum possible value for vc1
+            Delay.ThreadDelay = CodecContext->thread_count - 1;
         } else if (CodecContext->codec_id == AV_CODEC_ID_AV1) {
             // libdav1d.c exports delay like this.
-            Delay = CodecContext->delay;
+            Delay.ReorderDelay = CodecContext->delay;
         } else {
             // In theory we can move this to CodecContext->delay, sort of, one day, maybe. Not now.
-            Delay = CodecContext->has_b_frames; // Normal decoder delay
+            Delay.ReorderDelay = CodecContext->has_b_frames; // Normal decoder delay
             if (CodecContext->active_thread_type & FF_THREAD_FRAME) // Adjust for frame based threading
-                Delay += CodecContext->thread_count - 1;
+                Delay.ThreadDelay = CodecContext->thread_count - 1;
         }
+
+        SeekByPos = !strcmp(FormatContext->iformat->name, "mpeg") || !strcmp(FormatContext->iformat->name, "mpegts") || !strcmp(FormatContext->iformat->name, "mpegtsraw");
 
         // Always try to decode a frame to make sure all required parameters are known
         int64_t DummyPTS = 0, DummyPos = 0;
@@ -269,7 +298,7 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
         // Calculate the average framerate
         size_t TotalFrames = 0;
         for (size_t i = 0; i < Frames.size(); i++)
-            if (!Frames[i].Hidden)
+            if (!Frames[i].Skipped())
                 TotalFrames++;
 
         if (TotalFrames >= 2) {
@@ -630,12 +659,12 @@ void FFMS_VideoSource::SetVideoProperties() {
 }
 
 bool FFMS_VideoSource::HasPendingDelayedFrames() {
-    if (InitialDecode == -1) {
-        if (DelayCounter > Delay) {
-            --DelayCounter;
+    if (Stage == DecodeStage::APPLY_DELAY) {
+        if (Delay.IsExceeded()) {
+            Delay.Decrement();
             return true;
         }
-        InitialDecode = 0;
+        Stage = DecodeStage::DECODE_LOOP;
     }
     return false;
 }
@@ -644,48 +673,37 @@ bool FFMS_VideoSource::DecodePacket(AVPacket *Packet) {
     std::swap(DecodeFrame, LastDecodedFrame);
     ResendPacket = false;
 
+    int PacketNum = Frames.FrameFromPTS(Frames.UseDTS ? Packet->dts : Packet->pts, true);
+    bool PacketHidden = !!(Packet->flags & AV_PKT_FLAG_DISCARD) || (PacketNum != -1 && Frames[PacketNum].MarkedHidden);
+    bool SecondField = PacketNum != -1 && Frames[PacketNum].SecondField;
+
     int Ret = avcodec_send_packet(CodecContext, Packet);
     if (Ret == AVERROR(EAGAIN)) {
         // Send queue is full, so stash packet to resend on the next call.
-        DelayCounter--;
         ResendPacket = true;
+    } else if (Ret == 0) {
+        Delay.Increment(PacketHidden, SecondField);
     }
 
     Ret = avcodec_receive_frame(CodecContext, DecodeFrame);
-    if (Ret != 0) {
+    if (Ret == 0) {
+        Delay.Decrement();
+    } else {
         std::swap(DecodeFrame, LastDecodedFrame);
-        if (!(Packet->flags & AV_PKT_FLAG_DISCARD) || Ret == AVERROR(EAGAIN))
-            DelayCounter++;
-    } else if (!!(Packet->flags & AV_PKT_FLAG_DISCARD)) {
-        // If sending discarded frame when the decode buffer is not empty, caller
-        // may still obtained bufferred decoded frames and the number of frames
-        // in the buffer decreases.
-        DelayCounter--;
     }
 
-    if (Ret == 0 && InitialDecode == 1)
-        InitialDecode = -1;
+    if (Ret == 0 && Stage == DecodeStage::INITIALIZE)
+        Stage = DecodeStage::APPLY_DELAY;
 
-    // H.264 (PAFF) and HEVC can have one field per packet, and decoding delay needs
-    // to be adjusted accordingly.
-    if (CodecContext->codec_id == AV_CODEC_ID_H264 || CodecContext->codec_id == AV_CODEC_ID_HEVC) {
-        if (!!(LastDecodedFrame->flags & AV_FRAME_FLAG_INTERLACED))
-            HaveSeenInterlacedFrame = true;
-        if (!PAFFAdjusted && DelayCounter > Delay && HaveSeenInterlacedFrame && LastDecodedFrame->repeat_pict == 0 && Ret != 0) {
-            int OldBFrameDelay = Delay - (CodecContext->thread_count - 1);
-            Delay = 1 + OldBFrameDelay * 2 + (CodecContext->thread_count - 1);
-            PAFFAdjusted = true;
-        }
-    }
-
-    return (Ret == 0) || (DelayCounter > Delay && !InitialDecode);
+    return Ret == 0;
 }
 
 int FFMS_VideoSource::Seek(int n) {
     int ret = -1;
 
-    DelayCounter = 0;
-    InitialDecode = 1;
+    Delay.Reset();
+    if (Stage != DecodeStage::INITIALIZE_SOURCE)
+        Stage = DecodeStage::INITIALIZE;
 
     if (!SeekByPos || Frames[n].FilePos < 0) {
         ret = av_seek_frame(FormatContext, VideoTrack, Frames[n].PTS, AVSEEK_FLAG_BACKWARD);
@@ -804,6 +822,12 @@ void FFMS_VideoSource::DecodeNextFrame(int64_t &AStartTime, int64_t &Pos) {
 }
 
 bool FFMS_VideoSource::SeekTo(int n, int SeekOffset) {
+    bool ForceSeek = false;
+    if (Stage == DecodeStage::INITIALIZE_SOURCE) {
+        ForceSeek = true;
+        Stage = DecodeStage::INITIALIZE;
+    }
+
     // The semantics here are basically "return true if we don't know exactly where our seek ended up (destination isn't frame 0)"
     if (SeekMode >= 0) {
         int TargetFrame = n + SeekOffset;
@@ -811,16 +835,28 @@ bool FFMS_VideoSource::SeekTo(int n, int SeekOffset) {
             throw FFMS_Exception(FFMS_ERROR_SEEKING, FFMS_ERROR_UNKNOWN,
                 "Frame accurate seeking is not possible in this file");
 
+        // Seeking too close to the end of the stream can result in a different decoder delay since
+        // frames are returned as soon as draining starts, so avoid this to keep the delay predictable.
+        // Is the +1 necessary here? Not sure, but let's keep it to be safe.
+        int EndOfStreamDist = CodecContext->has_b_frames + 1;
+
+        if (CodecContext->codec_id == AV_CODEC_ID_H264)
+            // Work around a bug in ffmpeg's h264 decoder where frames are skipped when seeking too
+            // close to the end in open-gop files: https://trac.ffmpeg.org/ticket/10936
+            EndOfStreamDist *= 2;
+
+        TargetFrame = std::min(TargetFrame, Frames.RealFrameNumber(std::max(0, VP.NumFrames - 1 - EndOfStreamDist)));
+
         if (SeekMode < 3)
             TargetFrame = Frames.FindClosestVideoKeyFrame(TargetFrame);
 
         if (SeekMode == 0) {
             if (n < CurrentFrame) {
-                Seek(0);
+                Seek(Frames[0].OriginalPos);
             }
         } else {
             // 10 frames is used as a margin to prevent excessive seeking since the predicted best keyframe isn't always selected by avformat
-            if (n < CurrentFrame || TargetFrame > CurrentFrame + 10 || (SeekMode == 3 && n > CurrentFrame + 10)) {
+            if (ForceSeek || n < CurrentFrame || TargetFrame > CurrentFrame + 10 || (SeekMode == 3 && n > CurrentFrame + 10)) {
                 Seek(TargetFrame);
                 return true;
             }
@@ -836,23 +872,29 @@ FFMS_Frame *FFMS_VideoSource::GetFrame(int n) {
     GetFrameCheck(n);
     n = Frames.RealFrameNumber(n);
 
-    if (LastFrameNum == n)
+    if (Stage != DecodeStage::INITIALIZE_SOURCE && LastFrameNum == n)
         return &LocalFrame;
 
     int SeekOffset = 0;
     bool Seek = true;
+    bool WasSkipped = false;
 
     do {
         bool HasSeeked = false;
         if (Seek) {
             HasSeeked = SeekTo(n, SeekOffset);
             Seek = false;
+            WasSkipped = false;
         }
 
         int64_t StartTime = AV_NOPTS_VALUE, FilePos = -1;
-        bool Hidden = (((unsigned) CurrentFrame < Frames.size()) && Frames[CurrentFrame].Hidden);
-        if (HasSeeked || !Hidden || PAFFAdjusted)
-            DecodeNextFrame(StartTime, FilePos);
+        bool Skipped = (((unsigned) CurrentFrame < Frames.size()) && Frames[CurrentFrame].Skipped());
+        if (HasSeeked || !Skipped) {
+            if (WasSkipped)
+                WasSkipped = false;
+            else
+                DecodeNextFrame(StartTime, FilePos);
+        }
 
         if (!HasSeeked)
             continue;
@@ -891,10 +933,31 @@ FFMS_Frame *FFMS_VideoSource::GetFrame(int n) {
         // aggressive (non-keyframe) seeking.
         int64_t Pos = Frames[CurrentFrame].FilePos;
         if (CurrentFrame > 0 && Pos != -1) {
-            int Prev = CurrentFrame - 1;
-            while (Prev >= 0 && Frames[Prev].FilePos != -1 && Frames[Prev].FilePos > Pos)
-                --Prev;
-            CurrentFrame = Prev + 1;
+            while (true) {
+                int Prev = CurrentFrame - 1;
+                if (Prev >= 0 && Frames[Prev].SecondField)
+                    --Prev;
+
+                if (Prev >= 0 && (Frames[Prev].FilePos != -1 && Frames[Prev].FilePos > Pos))
+                    CurrentFrame = Prev;
+                else
+                    break;
+            }
+        }
+
+        if (Frames[CurrentFrame].Skipped()) {
+            // The frame number we seeked to was hidden.
+            // (This is not the same as the first packet we got being marked as hidden,
+            // it happens in cases like when the timestamps in decoding order are
+            //      0   -2   -1   1   2  ...
+            // and the frames with negative timestamps are hidden. Then, the first packet
+            // we get is the packet with timestamp 0, but Frames[CurrentFrame] corresponds
+            // to the frame with PTS -2. This can happen for open-gop files that have
+            // been cut at a non-IDR recovery point.)
+            // We should have skipped this frame at the start of this loop iteration, but
+            // we didn't know CurrentFrame at that point we and had to decode a frame to know
+            // the current frame. So now we need to remember to skip an extra frame.
+            WasSkipped = true;
         }
     } while (++CurrentFrame <= n);
 

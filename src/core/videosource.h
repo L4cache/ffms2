@@ -39,14 +39,32 @@ extern "C" {
 #include "track.h"
 #include "utils.h"
 
+enum class DecodeStage {
+    INITIALIZE_SOURCE,
+    INITIALIZE,
+    APPLY_DELAY,
+    DECODE_LOOP,
+};
+
+struct DecoderDelay {
+    int ThreadDelay = 0;
+    int ReorderDelay = 0;
+
+    int ThreadDelayCounter = 0;
+    int ReorderDelayCounter = 0;
+
+    void Reset();
+    void Increment(bool Hidden, bool SecondField);
+    void Decrement();
+    bool IsExceeded();
+};
+
 struct FFMS_VideoSource {
 private:
     SwsContext *SWS = nullptr;
 
-    int Delay = 0;
-    int DelayCounter = 0;
-    int InitialDecode = 1;
-    bool PAFFAdjusted = false;
+    DecoderDelay Delay;
+    DecodeStage Stage = DecodeStage::INITIALIZE_SOURCE;
 
     int LastFrameHeight = -1;
     int LastFrameWidth = -1;
